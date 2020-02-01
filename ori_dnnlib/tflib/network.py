@@ -360,7 +360,6 @@ class Network:
             minibatch_size: int = None,
             num_gpus: int = 1,
             assume_frozen: bool = False,
-            custom_inputs=None,
             **dynamic_kwargs) -> Union[np.ndarray, Tuple[np.ndarray, ...], List[np.ndarray]]:
         """Run this network for the given NumPy array(s), and return the output(s) as NumPy array(s).
 
@@ -377,7 +376,6 @@ class Network:
             num_gpus:           Number of GPUs to use.
             assume_frozen:      Improve multi-GPU performance by assuming that the trainable parameters will remain changed between calls.
             dynamic_kwargs:     Additional keyword arguments to be passed into the network build function.
-            custom_inputs:      Allow to use another Tensor as input instead of default Placeholders
         """
         assert len(in_arrays) == self.num_inputs
         assert not all(arr is None for arr in in_arrays)
@@ -401,14 +399,9 @@ class Network:
         # Build graph.
         if key not in self._run_cache:
             with tfutil.absolute_name_scope(self.scope + "/_Run"), tf.control_dependencies(None):
-                if custom_inputs is not None:
-                    with tf.device("/gpu:0"):
-                        in_expr = [input_builder(name) for input_builder, name in zip(custom_inputs, self.input_names)]
-                        in_split = list(zip(*[tf.split(x, num_gpus) for x in in_expr]))
-                else:
-                    with tf.device("/cpu:0"):
-                        in_expr = [tf.placeholder(tf.float32, name=name) for name in self.input_names]
-                        in_split = list(zip(*[tf.split(x, num_gpus) for x in in_expr]))
+                with tf.device("/cpu:0"):
+                    in_expr = [tf.placeholder(tf.float32, name=name) for name in self.input_names]
+                    in_split = list(zip(*[tf.split(x, num_gpus) for x in in_expr]))
 
                 out_split = []
                 for gpu in range(num_gpus):
@@ -458,6 +451,7 @@ class Network:
 
         if not return_as_list:
             out_arrays = out_arrays[0] if len(out_arrays) == 1 else tuple(out_arrays)
+
         return out_arrays
 
     def list_ops(self) -> List[TfExpression]:
@@ -554,6 +548,26 @@ class Network:
                     name = title + "_toplevel/" + local_name
 
                 tf.summary.histogram(name, var)
+
+    def save_my_model(self) -> None:
+        # 这儿是新添加的保存模型的代码,为方便转化为tfjs
+        # tf.train.Saver().save(tf.get_default_session(), 'networks/ckpt/my_net.ckpt')
+
+        graph = tf.get_default_graph()  # 获得默认的图
+        input_graph_def = graph.as_graph_def()  # 返回一个序列化的图代表当前的图
+        for node in input_graph_def.node:   # 把batchnorm给处理一下，不然不好转成tensorflowjs
+            if node.op == 'RefSwitch':
+                node.op = 'Switch'
+                for index in range(len(node.input)):
+                    if 'moving_' in node.input[index]:
+                        node.input[index] = node.input[index] + '/read'
+            elif node.op == 'AssignSub':
+                node.op = 'Sub'
+                if 'use_locking' in node.attr: del node.attr['use_locking']
+        with tf.get_default_session() as sess:
+            tf.saved_model.simple_save(sess, "./模型转换/saved_model",
+                                    inputs={self.input_names[0]: self.input_templates[0]},
+                                    outputs={self.output_names[0]: self.output_templates[0]})
 
 #----------------------------------------------------------------------------
 # Backwards-compatible emulation of legacy output transformation in Network.run().
